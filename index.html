@@ -11,6 +11,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.20.3/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lucide/0.441.0/umd/lucide.min.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
+<!-- Firebase SDK (cloud sync) -->
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
 <style>
 * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
 body { margin: 0; background: #FAFAFA; font-family: 'Rubik', system-ui, -apple-system, sans-serif; }
@@ -86,12 +89,113 @@ window.LucideIcons = new Proxy({}, {
   }
 });
 if (!window.storage) {
-  window.storage = {
-    get: function(key)        { try { var v = localStorage.getItem(key); return Promise.resolve(v===null?null:{key:key,value:v,shared:true}); } catch(e) { return Promise.resolve(null); } },
-    set: function(key,value)  { try { localStorage.setItem(key,value); return Promise.resolve({key:key,value:value,shared:true}); } catch(e) { return Promise.resolve(null); } },
-    delete: function(key)     { try { localStorage.removeItem(key); return Promise.resolve({key:key,deleted:true,shared:true}); } catch(e) { return Promise.resolve(null); } },
-    list: function(prefix)    { try { var keys=[]; for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i); if(!prefix||k.indexOf(prefix)===0) keys.push(k);} return Promise.resolve({keys:keys,prefix:prefix,shared:true}); } catch(e) { return Promise.resolve(null); } }
-  };
+  // ---- Firebase initialization (cloud sync) ----
+  var __fbReady = false;
+  try {
+    firebase.initializeApp({
+      apiKey: "AIzaSyCIw0L6vnjyCGZG68wZhjRT1DVp7c18Xoc",
+      authDomain: "popeye-katzav.firebaseapp.com",
+      projectId: "popeye-katzav",
+      storageBucket: "popeye-katzav.firebasestorage.app",
+      messagingSenderId: "270762825971",
+      appId: "1:270762825971:web:2a2e35fa498cad817cbf86"
+    });
+    window.__db = firebase.firestore();
+    // Offline persistence — works offline, syncs when reconnected
+    window.__db.enablePersistence({synchronizeTabs:true}).catch(function(e){
+      console.warn('Firestore offline persistence not available:', e.code);
+    });
+    __fbReady = true;
+  } catch (e) {
+    console.warn('Firebase init failed, falling back to localStorage:', e);
+  }
+
+  if (__fbReady) {
+    // ---- Firebase-backed storage (cloud) ----
+    var APP_DOC = window.__db.collection('app').doc('state');
+    var FieldValue = firebase.firestore.FieldValue;
+    var __cache = {};
+    var __listeners = {};
+
+    // Single global listener: keeps cache fresh + notifies subscribers
+    APP_DOC.onSnapshot(function(doc) {
+      __cache = (doc.exists ? doc.data() : {}) || {};
+      Object.keys(__listeners).forEach(function(key) {
+        var v = __cache[key];
+        var payload = (v != null) ? { key: key, value: v, shared: true } : null;
+        __listeners[key].forEach(function(cb){ try { cb(payload); } catch(e){} });
+      });
+    }, function(err){ console.error('Firestore listener:', err); });
+
+    window.storage = {
+      get: function(key, shared) {
+        if (!shared) {
+          try { var v = localStorage.getItem(key); return Promise.resolve(v===null?null:{key:key,value:v,shared:false}); }
+          catch(e) { return Promise.resolve(null); }
+        }
+        if (__cache[key] != null) return Promise.resolve({ key:key, value:__cache[key], shared:true });
+        return APP_DOC.get().then(function(d){
+          if (!d.exists) return null;
+          var data = d.data() || {};
+          return data[key] != null ? { key:key, value:data[key], shared:true } : null;
+        }).catch(function(){ return null; });
+      },
+      set: function(key, value, shared) {
+        if (!shared) {
+          try { localStorage.setItem(key, value); return Promise.resolve({key:key,value:value,shared:false}); }
+          catch(e) { return Promise.resolve(null); }
+        }
+        var u = {}; u[key] = value;
+        return APP_DOC.set(u, { merge: true }).then(function(){
+          __cache[key] = value;
+          return { key:key, value:value, shared:true };
+        }).catch(function(e){ console.error('storage.set:', e); return null; });
+      },
+      delete: function(key, shared) {
+        if (!shared) {
+          try { localStorage.removeItem(key); return Promise.resolve({key:key,deleted:true,shared:false}); }
+          catch(e) { return Promise.resolve(null); }
+        }
+        var u = {}; u[key] = FieldValue.delete();
+        return APP_DOC.update(u).then(function(){
+          delete __cache[key];
+          return { key:key, deleted:true, shared:true };
+        }).catch(function(){ return null; });
+      },
+      list: function(prefix, shared) {
+        if (!shared) {
+          try { var keys=[]; for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i); if(!prefix||k.indexOf(prefix)===0) keys.push(k);} return Promise.resolve({keys:keys,prefix:prefix,shared:false}); }
+          catch(e) { return Promise.resolve(null); }
+        }
+        var keys = Object.keys(__cache).filter(function(k){ return !prefix || k.indexOf(prefix)===0; });
+        return Promise.resolve({ keys:keys, prefix:prefix, shared:true });
+      },
+      // Real-time subscription: callback fires whenever cloud data changes
+      onChange: function(key, callback) {
+        if (!__listeners[key]) __listeners[key] = [];
+        __listeners[key].push(callback);
+        // Fire immediately with current cached value
+        if (__cache[key] != null) {
+          try { callback({ key:key, value:__cache[key], shared:true }); } catch(e){}
+        }
+        return function() {
+          if (__listeners[key]) {
+            var i = __listeners[key].indexOf(callback);
+            if (i >= 0) __listeners[key].splice(i, 1);
+          }
+        };
+      }
+    };
+  } else {
+    // ---- Fallback: localStorage only (no cloud sync) ----
+    window.storage = {
+      get: function(key) { try { var v = localStorage.getItem(key); return Promise.resolve(v===null?null:{key:key,value:v,shared:true}); } catch(e) { return Promise.resolve(null); } },
+      set: function(key,value) { try { localStorage.setItem(key,value); return Promise.resolve({key:key,value:value,shared:true}); } catch(e) { return Promise.resolve(null); } },
+      delete: function(key) { try { localStorage.removeItem(key); return Promise.resolve({key:key,deleted:true,shared:true}); } catch(e) { return Promise.resolve(null); } },
+      list: function(prefix) { try { var keys=[]; for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i); if(!prefix||k.indexOf(prefix)===0) keys.push(k);} return Promise.resolve({keys:keys,prefix:prefix,shared:true}); } catch(e) { return Promise.resolve(null); } },
+      onChange: function() { return function(){}; }
+    };
+  }
 }
 </script>
 <script type="text/babel" data-presets="react">
@@ -1874,53 +1978,73 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let unsub = null;
+
+    // Helper: parse cloud data and merge with defaults, then update React state
+    const handleCloudData = (rawValue) => {
+      try {
+        const parsed = JSON.parse(rawValue);
+        // Merge clients: overlay missing brand/logo/color/phone/warehouseCode/defaultOrderer fields from defaults by id.
+        const defaultsById = Object.fromEntries(defaultData.clients.map(c => [c.id, c]));
+        const mergedClients = (parsed.clients || defaultData.clients).map(c => {
+          const def = defaultsById[c.id] || {};
+          return {
+            ...c,
+            brand: c.brand ?? def.brand,
+            logo: c.logo ?? def.logo,
+            color: c.color ?? def.color,
+            phone: c.phone || def.phone || '',
+            warehouseCode: c.warehouseCode ?? def.warehouseCode ?? '1',
+            defaultOrdererName:  c.defaultOrdererName  ?? def.defaultOrdererName  ?? '',
+            defaultOrdererPhone: c.defaultOrdererPhone ?? def.defaultOrdererPhone ?? '',
+          };
+        });
+        // Merge orders: keep saved orders, inject demo orders that don't exist yet
+        const existingOrderIds = new Set((parsed.orders || []).map(o => o.id));
+        const missingDemoOrders = (defaultData.orders || []).filter(o => !existingOrderIds.has(o.id));
+        const mergedOrders = [...missingDemoOrders, ...(parsed.orders || [])];
+        // Migrate products: ensure orderUnit + billingUnit exist
+        const mergedProducts = (parsed.products || defaultData.products).map(p => ({
+          ...p,
+          orderUnit: p.orderUnit || 'units',
+          billingUnit: p.billingUnit || 'kg',
+        }));
+        setData({ ...defaultData, ...parsed, clients: mergedClients, orders: mergedOrders, products: mergedProducts });
+      } catch (e) {
+        console.error('Failed to parse cloud data:', e);
+      }
+    };
+
     (async () => {
       try {
+        // First load: get current state from cloud
         const r = await window.storage.get(STORAGE_KEY, true);
         if (r && r.value) {
-          const parsed = JSON.parse(r.value);
-          // Merge clients: overlay missing brand/logo/color/phone/warehouseCode/defaultOrderer fields from defaults by id.
-          const defaultsById = Object.fromEntries(defaultData.clients.map(c => [c.id, c]));
-          const mergedClients = (parsed.clients || defaultData.clients).map(c => {
-            const def = defaultsById[c.id] || {};
-            return {
-              ...c,
-              brand: c.brand ?? def.brand,
-              logo: c.logo ?? def.logo,
-              color: c.color ?? def.color,
-              // For phone: use saved value if non-empty, otherwise fall back to default.
-              // This way existing users with empty phone get the new contact phone.
-              phone: c.phone || def.phone || '',
-              warehouseCode: c.warehouseCode ?? def.warehouseCode ?? '1',
-              // Permanent contact person (auto-fills order forms, no need to retype)
-              defaultOrdererName:  c.defaultOrdererName  ?? def.defaultOrdererName  ?? '',
-              defaultOrdererPhone: c.defaultOrdererPhone ?? def.defaultOrdererPhone ?? '',
-            };
-          });
-          // Merge orders: keep user's saved orders, but inject any default demo orders
-          // that don't exist yet (matched by id). This brings the demo order to existing users.
-          const existingOrderIds = new Set((parsed.orders || []).map(o => o.id));
-          const missingDemoOrders = (defaultData.orders || []).filter(o => !existingOrderIds.has(o.id));
-          const mergedOrders = [...missingDemoOrders, ...(parsed.orders || [])];
-          // Migrate products: ensure orderUnit + billingUnit exist (legacy data had only `unit`)
-          const mergedProducts = (parsed.products || defaultData.products).map(p => ({
-            ...p,
-            orderUnit: p.orderUnit || 'units',
-            billingUnit: p.billingUnit || 'kg',
-          }));
-          setData({ ...defaultData, ...parsed, clients: mergedClients, orders: mergedOrders, products: mergedProducts });
+          handleCloudData(r.value);
         } else {
+          // Empty cloud → seed with defaults (first-time setup)
           await window.storage.set(STORAGE_KEY, JSON.stringify(defaultData), true);
         }
-      } catch {
+      } catch (e) {
         try { await window.storage.set(STORAGE_KEY, JSON.stringify(defaultData), true); } catch {}
       }
+      // Load logged-in user (kept local — each device has its own login)
       try {
         const u = await window.storage.get(USER_KEY, false);
         if (u && u.value) setCurrentUser(u.value);
       } catch {}
       setLoading(false);
+
+      // Subscribe to real-time updates from the cloud (cross-device sync)
+      // When any device writes to Firestore, all other devices receive the change.
+      if (window.storage.onChange) {
+        unsub = window.storage.onChange(STORAGE_KEY, (r) => {
+          if (r && r.value) handleCloudData(r.value);
+        });
+      }
     })();
+
+    return () => { if (unsub) unsub(); };
   }, []);
 
   const saveData = async (newData) => {
